@@ -1,5 +1,6 @@
 <script lang="ts">
   import { getCurrentWindow } from '@tauri-apps/api/window'
+  import ServerProfileSwitcher from './ServerProfileSwitcher.svelte'
 
   const appWindow = getCurrentWindow()
 
@@ -18,6 +19,8 @@
     </div>
     <div class="titlebar-name">MH <span>Multiverse</span></div>
   </div>
+
+  <ServerProfileSwitcher />
 
   <div class="titlebar-controls">
     <button class="titlebar-btn" on:click={minimize} aria-label="Minimize">

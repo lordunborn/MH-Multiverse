@@ -120,12 +120,26 @@ pub struct Server {
     pub password_nonce: String,
 }
 
+/// A named local server installation (e.g. "Master", "TahitiRepro", "1.53 Test Bed").
+/// Distinct from `Server` above, which is the remote/account connection profile used
+/// elsewhere in the app -- this is purely "which server_exe on this machine is active".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerProfile {
+    pub id: String,
+    pub name: String,
+    pub server_exe: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub game_exe: String,
     pub server_exe: String,
     pub active_server_id: String,
     pub servers: Vec<Server>,
+    #[serde(default)]
+    pub server_profiles: Vec<ServerProfile>,
+    #[serde(default)]
+    pub active_server_profile_id: String,
     #[serde(default)]
     pub theme: String,
     #[serde(default)]
@@ -156,6 +170,8 @@ impl Default for AppConfig {
             server_exe: String::new(),
             active_server_id: String::new(),
             servers: Vec::new(),
+            server_profiles: Vec::new(),
+            active_server_profile_id: String::new(),
             theme: String::new(),
             launch_options: LaunchOptions::default(),
             shutdown: ShutdownConfig::default(),
@@ -330,6 +346,79 @@ pub fn set_active_server(app: tauri::AppHandle, server_id: String) -> Result<(),
     let mut config = load_config(&app);
     config.active_server_id = server_id;
     save_config(&app, &config)
+}
+
+/// True if a server child process is currently alive. Used to block switching
+/// the active server profile out from under a running server.
+fn is_server_running(app: &tauri::AppHandle) -> bool {
+    let state = app.state::<server::ServerState>();
+    let mut proc = match state.0.lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    match proc.child {
+        Some(ref mut child) => matches!(child.try_wait(), Ok(None)),
+        None => false,
+    }
+}
+
+#[tauri::command]
+pub fn upsert_server_profile(app: tauri::AppHandle, profile: ServerProfile) -> Result<AppConfig, String> {
+    let mut config = load_config(&app);
+
+    let is_new = !config.server_profiles.iter().any(|p| p.id == profile.id);
+
+    if let Some(existing) = config.server_profiles.iter_mut().find(|p| p.id == profile.id) {
+        *existing = profile.clone();
+    } else {
+        config.server_profiles.push(profile.clone());
+    }
+
+    // First profile ever added becomes active automatically.
+    if is_new && config.active_server_profile_id.is_empty() && !is_server_running(&app) {
+        config.active_server_profile_id = profile.id.clone();
+        config.server_exe = profile.server_exe.clone();
+    }
+
+    // Keep server_exe in sync if the currently active profile's path was edited.
+    if config.active_server_profile_id == profile.id {
+        config.server_exe = profile.server_exe.clone();
+    }
+
+    save_config(&app, &config)?;
+    app.state::<server::DbPath>().set_from_server_exe(&config.server_exe);
+    Ok(config)
+}
+
+#[tauri::command]
+pub fn delete_server_profile(app: tauri::AppHandle, profile_id: String) -> Result<AppConfig, String> {
+    let mut config = load_config(&app);
+    config.server_profiles.retain(|p| p.id != profile_id);
+    if config.active_server_profile_id == profile_id {
+        config.active_server_profile_id = String::new();
+        config.server_exe = String::new();
+    }
+    save_config(&app, &config)?;
+    Ok(config)
+}
+
+#[tauri::command]
+pub fn set_active_server_profile(app: tauri::AppHandle, profile_id: String) -> Result<AppConfig, String> {
+    if is_server_running(&app) {
+        return Err("Stop the running server before switching profiles.".into());
+    }
+
+    let mut config = load_config(&app);
+    let profile = config.server_profiles.iter()
+        .find(|p| p.id == profile_id)
+        .ok_or("Profile not found")?
+        .clone();
+
+    config.active_server_profile_id = profile.id.clone();
+    config.server_exe = profile.server_exe.clone();
+    save_config(&app, &config)?;
+    app.state::<server::DbPath>().set_from_server_exe(&profile.server_exe);
+    Ok(config)
 }
 
 #[tauri::command]

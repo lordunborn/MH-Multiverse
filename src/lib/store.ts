@@ -151,11 +151,22 @@ export interface Server {
   use_https?: boolean
 }
 
+// A named local server installation (e.g. "Master", "TahitiRepro", "1.53 Test
+// Bed") -- distinct from Server above, which is the remote/account connection
+// profile used elsewhere in the app.
+export interface ServerProfile {
+  id: string
+  name: string
+  server_exe: string
+}
+
 export interface AppConfig {
   game_exe: string
   server_exe: string
   active_server_id: string
   servers: Server[]
+  server_profiles: ServerProfile[]
+  active_server_profile_id: string
   theme: string
   launch_options: LaunchOptions
   shutdown: ShutdownConfig
@@ -190,6 +201,8 @@ export const appConfig = writable<AppConfig>({
   server_exe: '',
   active_server_id: '',
   servers: [],
+  server_profiles: [],
+  active_server_profile_id: '',
   theme: '',
   launch_options: defaultLaunchOptions,
   shutdown: defaultShutdownConfig,
@@ -245,6 +258,23 @@ export async function deleteServer(serverId: string): Promise<void> {
 export async function selectServer(serverId: string): Promise<void> {
   activeServerId.set(serverId)
   await invoke('set_active_server', { serverId })
+}
+
+export async function upsertServerProfile(profile: ServerProfile): Promise<void> {
+  const updated = await invoke<AppConfig>('upsert_server_profile', { profile })
+  appConfig.set(updated)
+}
+
+export async function deleteServerProfile(profileId: string): Promise<void> {
+  const updated = await invoke<AppConfig>('delete_server_profile', { profileId })
+  appConfig.set(updated)
+}
+
+// Throws if a server is currently running -- callers should catch and surface
+// the message (e.g. "Stop the running server before switching profiles.").
+export async function setActiveServerProfile(profileId: string): Promise<void> {
+  const updated = await invoke<AppConfig>('set_active_server_profile', { profileId })
+  appConfig.set(updated)
 }
 
 export async function setGameExe(path: string): Promise<void> {
