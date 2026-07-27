@@ -90,10 +90,12 @@
     if (vt === 'Integer')  return parseInt(s, 10)
     if (vt === 'Float')    return parseFloat(s)
     if (COMPLEX.has(vt))   { try { return JSON.parse(s) } catch { return s } }
-    // ID types: numeric where possible. Values > MAX_SAFE_INTEGER lose JS precision —
-    // use prototype search auto-fill to avoid manual entry of large IDs.
-    const n = Number(s)
-    return isNaN(n) ? s : n
+    // ID types (PrototypeId/PrototypeDataRef/PrototypeGuid/LocaleStringId) and Enum
+    // stay strings end-to-end — these are 64-bit values that exceed
+    // Number.MAX_SAFE_INTEGER, and converting through Number() here silently
+    // rounds them. The Rust side (save_patch_file) converts back to a raw JSON
+    // integer for the on-disk file, which is what the server expects.
+    return s
   }
 
   function validateValueStr(s: string, vt: string): string {

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value as JsonValue;
+use serde_json::{Number as JsonNumber, Value as JsonValue};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -44,6 +44,55 @@ fn file_path(patches: &Path, file_name: &str, enabled: bool) -> PathBuf {
         patches.join(file_name)
     } else {
         off_dir(patches).join(file_name)
+    }
+}
+
+// ── ID precision helpers ───────────────────────────────────────────────────────
+//
+// PrototypeId/PrototypeGuid/etc. are 64-bit and routinely exceed
+// Number.MAX_SAFE_INTEGER (2^53). serde_json preserves u64 precision fine on
+// its own, but Tauri's IPC bridge round-trips command payloads through the
+// webview's JSON, which silently rounds any JSON number outside that range.
+// Ferrying these values as strings across the boundary keeps full precision;
+// the server's own patch file format expects them back as bare integers, so
+// save_patch_file converts them back before anything hits disk.
+
+const SCALAR_ID_TYPES: &[&str] = &["PrototypeId", "PrototypeDataRef", "PrototypeGuid", "LocaleStringId"];
+const ARRAY_ID_TYPES: &[&str] = &["PrototypeId[]", "PrototypeDataRef[]"];
+
+fn ids_to_strings(entry: &mut PatchEntry) {
+    if SCALAR_ID_TYPES.contains(&entry.value_type.as_str()) {
+        if let JsonValue::Number(n) = &entry.value {
+            entry.value = JsonValue::String(n.to_string());
+        }
+    } else if ARRAY_ID_TYPES.contains(&entry.value_type.as_str()) {
+        if let JsonValue::Array(arr) = &mut entry.value {
+            for v in arr.iter_mut() {
+                if let JsonValue::Number(n) = v {
+                    *v = JsonValue::String(n.to_string());
+                }
+            }
+        }
+    }
+}
+
+fn ids_to_numbers(entry: &mut PatchEntry) {
+    if SCALAR_ID_TYPES.contains(&entry.value_type.as_str()) {
+        if let JsonValue::String(s) = &entry.value {
+            if let Ok(n) = s.parse::<u64>() {
+                entry.value = JsonValue::Number(JsonNumber::from(n));
+            }
+        }
+    } else if ARRAY_ID_TYPES.contains(&entry.value_type.as_str()) {
+        if let JsonValue::Array(arr) = &mut entry.value {
+            for v in arr.iter_mut() {
+                if let JsonValue::String(s) = v {
+                    if let Ok(n) = s.parse::<u64>() {
+                        *v = JsonValue::Number(JsonNumber::from(n));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -107,8 +156,14 @@ pub fn load_patch_file(
     let text = fs::read_to_string(&path)
         .map_err(|e| format!("Cannot read {file_name}: {e}"))?;
 
-    serde_json::from_str(&text)
-        .map_err(|e| format!("Cannot parse {file_name}: {e}"))
+    let mut entries: Vec<PatchEntry> = serde_json::from_str(&text)
+        .map_err(|e| format!("Cannot parse {file_name}: {e}"))?;
+
+    for entry in &mut entries {
+        ids_to_strings(entry);
+    }
+
+    Ok(entries)
 }
 
 /// Write entries back to a patch file, pretty-printed.
@@ -117,10 +172,14 @@ pub fn save_patch_file(
     server_exe: String,
     file_name: String,
     enabled: bool,
-    entries: Vec<PatchEntry>,
+    mut entries: Vec<PatchEntry>,
 ) -> Result<(), String> {
     let patches = patches_dir(&server_exe)?;
     let path = file_path(&patches, &file_name, enabled);
+
+    for entry in &mut entries {
+        ids_to_numbers(entry);
+    }
 
     let text = serde_json::to_string_pretty(&entries)
         .map_err(|e| format!("Cannot serialise entries: {e}"))?;
