@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -121,6 +121,27 @@ fn collect_files_recursive(
     base: &Path,
     out: &mut Vec<(std::path::PathBuf, String)>,
 ) -> Result<(), String> {
+    let mut visited: HashSet<std::path::PathBuf> = HashSet::new();
+    collect_files_recursive_inner(dir, base, out, &mut visited)
+}
+
+// Windows directory junctions/reparse points can point back at an ancestor
+// directory, turning a plain recursive walk into an infinite loop with no
+// error — the Tauri command just hangs forever and the UI is stuck on
+// "Loading…" indefinitely. Canonicalizing each directory before descending
+// into it and refusing to revisit one closes that off.
+fn collect_files_recursive_inner(
+    dir: &Path,
+    base: &Path,
+    out: &mut Vec<(std::path::PathBuf, String)>,
+    visited: &mut HashSet<std::path::PathBuf>,
+) -> Result<(), String> {
+    let canonical = std::fs::canonicalize(dir)
+        .map_err(|e| format!("Cannot resolve directory {}: {e}", dir.display()))?;
+    if !visited.insert(canonical) {
+        return Ok(());
+    }
+
     let read_dir = std::fs::read_dir(dir)
         .map_err(|e| format!("Cannot read directory {}: {e}", dir.display()))?;
 
@@ -129,7 +150,7 @@ fn collect_files_recursive(
         let path = entry.path();
 
         if path.is_dir() {
-            collect_files_recursive(&path, base, out)?;
+            collect_files_recursive_inner(&path, base, out, visited)?;
         } else {
             let relative = path
                 .strip_prefix(base)

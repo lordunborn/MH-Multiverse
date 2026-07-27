@@ -40,6 +40,7 @@
     { value: 'AlwaysOn',         label: 'Always on' },
     { value: 'WeeklyRotation',   label: 'Weekly rotation' },
     { value: 'DayOfWeek',        label: 'Day of week' },
+    { value: 'DayOfWeekRotation', label: 'Day of week rotation' },
     { value: 'SpecialDate',      label: 'Special date' },
     { value: 'SpecialDateLunar', label: 'Special date (lunar)' },
   ]
@@ -72,9 +73,9 @@
 
   // ── Derived ─────────────────────────────────────────────────────────────────
 
-  $: needsDow       = rule_type === 'WeeklyRotation' || rule_type === 'DayOfWeek'
+  $: needsDow       = rule_type === 'WeeklyRotation' || rule_type === 'DayOfWeek' || rule_type === 'DayOfWeekRotation'
   $: needsDate      = rule_type === 'SpecialDate'    || rule_type === 'SpecialDateLunar'
-  $: isRotation     = rule_type === 'WeeklyRotation'
+  $: isRotation     = rule_type === 'WeeklyRotation' || rule_type === 'DayOfWeekRotation'
   $: availableToAdd = allEvents.filter(e => !events.includes(e.id))
 
   $: isDirty =

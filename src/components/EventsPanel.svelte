@@ -89,12 +89,13 @@
   $: definitionById = Object.fromEntries(definitions.map(d => [d.id, d]))
 
   // Rule groups for sidebar — SpecialDate and SpecialDateLunar share a group
-  const GROUP_ORDER  = ['AlwaysOn', 'DayOfWeek', 'WeeklyRotation', 'SpecialDate'] as const
+  const GROUP_ORDER  = ['AlwaysOn', 'DayOfWeek', 'WeeklyRotation', 'DayOfWeekRotation', 'SpecialDate'] as const
   const GROUP_LABELS: Record<string, string> = {
-    AlwaysOn:       'Always on',
-    DayOfWeek:      'Day of week',
-    WeeklyRotation: 'Weekly rotation',
-    SpecialDate:    'Special dates',
+    AlwaysOn:          'Always on',
+    DayOfWeek:         'Day of week',
+    WeeklyRotation:    'Weekly rotation',
+    DayOfWeekRotation: 'Day of week rotation',
+    SpecialDate:       'Special dates',
   }
 
   $: ruleGroups = GROUP_ORDER
@@ -118,7 +119,7 @@
     for (const rule of rules) {
       if (!isActiveNow(rule, now)) continue
 
-      if (rule.rule_type === 'WeeklyRotation') {
+      if (rule.rule_type === 'WeeklyRotation' || rule.rule_type === 'DayOfWeekRotation') {
         items.push({ kind: 'rotation', rule })
         continue
       }
@@ -135,8 +136,10 @@
 
   $: activeEventIds = rules.length >= 0 ? Array.from(getActiveEventIds(getAdjustedNow())) : []
 
-  // Key for {#key} block — forces rule editor remount on selection change
-  $: editorKey = creatingRule ? '__creating__' : (selectedRule?.name ?? '')
+  // Key for {#key} block — forces rule editor remount on selection change.
+  // Keyed by object reference, not name: two distinct rules can share a name
+  // (e.g. "Permanent Events" appears twice in real EventSchedule.json data).
+  $: editorKey = creatingRule ? '__creating__' : selectedRule
 
   // ── Status helpers ──────────────────────────────────────────────────────────
 
@@ -151,6 +154,7 @@
       case 'WeeklyRotation':
         return true
       case 'DayOfWeek':
+      case 'DayOfWeekRotation':
         return rule.start_day_of_week != null
           && now.getUTCDay() === dayIndex(rule.start_day_of_week)  // was getDay()
       case 'SpecialDate':
@@ -176,12 +180,13 @@
 
   function ruleTypeLabel(rule: ScheduleRule): string {
     switch (rule.rule_type) {
-      case 'AlwaysOn':         return 'Always on'
-      case 'WeeklyRotation':   return 'Weekly rotation'
-      case 'DayOfWeek':        return `${rule.start_day_of_week ?? 'Day'} only`
-      case 'SpecialDate':      return 'Special date'
-      case 'SpecialDateLunar': return 'Lunar date'
-      default:                 return rule.rule_type
+      case 'AlwaysOn':          return 'Always on'
+      case 'WeeklyRotation':    return 'Weekly rotation'
+      case 'DayOfWeek':         return `${rule.start_day_of_week ?? 'Day'} only`
+      case 'DayOfWeekRotation': return `${rule.start_day_of_week ?? 'Day'} rotation`
+      case 'SpecialDate':       return 'Special date'
+      case 'SpecialDateLunar':  return 'Lunar date'
+      default:                  return rule.rule_type
     }
   }
 
@@ -208,7 +213,7 @@
     for (const rule of rules) {
       if (!isActiveNow(rule, now)) continue
 
-      if (rule.rule_type === 'WeeklyRotation') {
+      if (rule.rule_type === 'WeeklyRotation' || rule.rule_type === 'DayOfWeekRotation') {
         const startDay = rule.start_day_of_week != null ? dayIndex(rule.start_day_of_week) : 0
         const activeId = getWeeklyRotationEvent(rule.events, startDay, now)
         if (activeId) ids.add(activeId)
@@ -269,9 +274,14 @@
     saving  = true
     opError = ''
     try {
+      // Identity here must be by object reference, not by name: the game's
+      // real EventSchedule.json legitimately ships multiple rules sharing a
+      // name (e.g. two separate "Permanent Events" rules), and `rules`/`r`
+      // are the same underlying objects as `selectedRule` (just sorted/
+      // filtered views), so reference equality is both correct and safe.
       const newRules = creatingRule
         ? [...rules, updated]
-        : rules.map(r => r.name === selectedRule?.name ? updated : r)
+        : rules.map(r => r === selectedRule ? updated : r)
       await invoke('save_schedule_override', {
         serverExe: $appConfig.server_exe,
         rules: newRules,
@@ -430,11 +440,11 @@
           <div class="rule-list">
             {#each ruleGroups as group (group.key)}
               <div class="rule-group-label">{group.label}</div>
-              {#each group.rules as rule (rule.name)}
+              {#each group.rules as rule (rule)}
                 {@const status = ruleStatus(rule)}
                 <div
                   class="rule-item"
-                  class:active={selectedRule?.name === rule.name && !creatingRule}
+                  class:active={selectedRule === rule && !creatingRule}
                   class:rule-disabled={!rule.is_enabled}
                   role="button"
                   tabindex="0"
