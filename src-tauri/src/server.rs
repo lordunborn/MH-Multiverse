@@ -116,6 +116,14 @@ pub struct ServerProcess {
     pub apache_child: Option<Child>,
     #[cfg(target_os = "windows")]
     _job: Option<JobObject>,
+    // Apache gets its own Job Object (KILL_ON_JOB_CLOSE), same as the game
+    // server's _job above. Without this, if MH-Multiverse crashes or is
+    // force-killed while Apache is running, Apache is orphaned -- invisible
+    // to the next launch (a fresh ServerState has no reference to it) but
+    // still holding its port, so a subsequent "Start Apache" spawns a second
+    // instance that fails to bind and dies shortly after.
+    #[cfg(target_os = "windows")]
+    _apache_job: Option<JobObject>,
 }
 
 impl ServerProcess {
@@ -125,6 +133,8 @@ impl ServerProcess {
             apache_child: None,
             #[cfg(target_os = "windows")]
             _job: None,
+            #[cfg(target_os = "windows")]
+            _apache_job: None,
         }
     }
 }
@@ -179,11 +189,15 @@ pub fn kill_child(proc: &mut ServerProcess) {
         let _ = child.wait();
     }
     proc.child = None;
+    #[cfg(target_os = "windows")]
+    { proc._job = None; }
     if let Some(ref mut apache) = proc.apache_child {
         let _ = apache.kill();
         let _ = apache.wait();
     }
     proc.apache_child = None;
+    #[cfg(target_os = "windows")]
+    { proc._apache_job = None; }
 }
 
 // -- Parse a raw log line into structured fields --
@@ -622,6 +636,8 @@ pub async fn start_server(
                                 let _ = apache.kill();
                                 let _ = apache.wait();
                             }
+                            #[cfg(target_os = "windows")]
+                            { proc._apache_job = None; }
 
                             // Release job object
                             #[cfg(target_os = "windows")]
@@ -709,7 +725,7 @@ pub async fn stop_server(app: AppHandle) -> Result<(), String> {
         }
 
         #[cfg(target_os = "windows")]
-        { proc._job = None; }
+        { proc._job = None; proc._apache_job = None; }
 
         // Watcher thread may have exited its loop when it saw child = None
         // from the kill above, so emit ourselves as a fallback.
@@ -763,6 +779,22 @@ pub async fn start_apache(app: AppHandle, server_exe: String) -> Result<(), Stri
         .spawn()
         .map_err(|e| format!("Failed to start Apache: {e}"))?;
 
+    // Assign to its own Job Object (Windows only) so Apache dies with us
+    // instead of being orphaned if MH-Multiverse crashes or is force-killed.
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::io::AsRawHandle;
+        let job = create_job_object();
+        if let Some(ref j) = job {
+            unsafe {
+                let raw_handle = child.as_raw_handle();
+                let handle = HANDLE(raw_handle as *mut core::ffi::c_void);
+                let _ = AssignProcessToJobObject(j.0, handle);
+            }
+        }
+        proc._apache_job = job;
+    }
+
     proc.apache_child = Some(child);
 
     let _ = app.emit("server-log", vec![LogLinePayload {
@@ -782,6 +814,8 @@ pub async fn stop_apache(app: AppHandle) -> Result<(), String> {
     if let Some(mut apache) = proc.apache_child.take() {
         let _ = apache.kill();
         let _ = apache.wait();
+        #[cfg(target_os = "windows")]
+        { proc._apache_job = None; }
 
         let _ = app.emit("server-log", vec![LogLinePayload {
             time: log_timestamp(),

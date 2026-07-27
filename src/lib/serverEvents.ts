@@ -103,13 +103,16 @@ async function syncInitialState() {
 
   if (running) {
     startUptime()
-    const apache = await invoke<boolean>('apache_is_running')
-    apacheRunning.set(apache)
     clearServerError()
   } else {
-    apacheRunning.set(false)
     stopUptime()
   }
+
+  // Apache is started/stopped independently of the main server, so its state
+  // has to be checked regardless of whether the server is currently running --
+  // otherwise Apache running on its own gets silently reported as stopped.
+  const apache = await invoke<boolean>('apache_is_running')
+  apacheRunning.set(apache)
 }
 
 export async function initServerEventBridge(): Promise<void> {
@@ -146,10 +149,18 @@ export async function initServerEventBridge(): Promise<void> {
     }
   })
 
-  bridge.unlistenStopped = await listen<ServerStoppedPayload>('server-stopped', (event) => {
+  bridge.unlistenStopped = await listen<ServerStoppedPayload>('server-stopped', async (event) => {
     serverRunning.set(false)
-    apacheRunning.set(false)
     stopUptime()
+
+    // Apache is independent of the server (stop_server's normal path leaves
+    // apache_child alone), so don't assume it stopped too -- check for real.
+    try {
+      const apache = await invoke<boolean>('apache_is_running')
+      apacheRunning.set(apache)
+    } catch {
+      apacheRunning.set(false)
+    }
 
     if (event.payload.exit_code !== null && event.payload.exit_code !== 0) {
       const message = `Server exited unexpectedly (code ${event.payload.exit_code})`
