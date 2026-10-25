@@ -49,8 +49,8 @@ The app is currently Windows-only and communicates with the server via stdin/std
 
 ### Store Catalog Editor
 - Load, create, edit, and delete catalog entries across `Catalog*.json` files in `Data/Game/MTXStore`
-- Non-destructive editing - saves always write to `*MODIFIED.json` sidecar files; base catalog files are never modified
-- Automatic `.bak` snapshots before every write
+- Edits are written directly into the existing catalog files (no `*MODIFIED.json` files are created); unknown fields, key order and line endings are kept
+- A `.bak` copy of each file the first time it is written in a session
 - Prototype item picker with display name resolution (embedded + custom override maps)
 - Type and modifier assignment matching MHServerEmu's catalog type system
 - Bundle HTML page generation for in-game store display, with customisable CSS

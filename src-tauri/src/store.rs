@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use crate::calligraphy::{ensure_catalogue_loaded, CatalogueState};
 
@@ -296,6 +298,156 @@ fn load_disk_entries(path: &Path) -> Vec<CatalogEntryDisk> {
         .unwrap_or_default()
 }
 
+// ── Direct catalog file editing ───────────────────────────────────────────────
+
+/// Line-ending and BOM style of a catalog file, so a rewrite does not change them.
+struct FileStyle {
+    bom: bool,
+    crlf: bool,
+    trailing_newline: bool,
+}
+
+fn sku_of(entry: &Value) -> Option<u64> {
+    entry.get("SkuId").and_then(Value::as_u64)
+}
+
+/// Read a catalog file as raw JSON values (nothing is dropped), plus its style.
+fn read_catalog_file(path: &Path) -> Result<(Vec<Value>, FileStyle), String> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let bytes = fs::read(path).map_err(|e| format!("Cannot read {name}: {e}"))?;
+    let bom = bytes.starts_with(&[0xEF, 0xBB, 0xBF]);
+    let text = std::str::from_utf8(if bom { &bytes[3..] } else { &bytes })
+        .map_err(|e| format!("{name} is not valid UTF-8: {e}"))?;
+    let crlf = text.contains("\r\n");
+    let trailing_newline = text.ends_with('\n');
+    let value: Value =
+        serde_json::from_str(text).map_err(|e| format!("{name} is not valid JSON: {e}"))?;
+    match value {
+        Value::Array(entries) => Ok((entries, FileStyle { bom, crlf, trailing_newline })),
+        _ => Err(format!("{name} is not a JSON array of catalog entries")),
+    }
+}
+
+/// Pretty formatter that escapes strings the way the server's .NET writer did, so a rewrite
+/// leaves untouched text byte-for-byte the same: `"` `'` `&` `+` `<` `>` `` ` `` and every
+/// non-ASCII character become `\uXXXX` (upper-case hex).
+struct DotNetFormatter<'a>(serde_json::ser::PrettyFormatter<'a>);
+
+impl serde_json::ser::Formatter for DotNetFormatter<'_> {
+    fn begin_array<W: ?Sized + io::Write>(&mut self, w: &mut W) -> io::Result<()> {
+        self.0.begin_array(w)
+    }
+    fn end_array<W: ?Sized + io::Write>(&mut self, w: &mut W) -> io::Result<()> {
+        self.0.end_array(w)
+    }
+    fn begin_array_value<W: ?Sized + io::Write>(&mut self, w: &mut W, first: bool) -> io::Result<()> {
+        self.0.begin_array_value(w, first)
+    }
+    fn end_array_value<W: ?Sized + io::Write>(&mut self, w: &mut W) -> io::Result<()> {
+        self.0.end_array_value(w)
+    }
+    fn begin_object<W: ?Sized + io::Write>(&mut self, w: &mut W) -> io::Result<()> {
+        self.0.begin_object(w)
+    }
+    fn end_object<W: ?Sized + io::Write>(&mut self, w: &mut W) -> io::Result<()> {
+        self.0.end_object(w)
+    }
+    fn begin_object_key<W: ?Sized + io::Write>(&mut self, w: &mut W, first: bool) -> io::Result<()> {
+        self.0.begin_object_key(w, first)
+    }
+    fn begin_object_value<W: ?Sized + io::Write>(&mut self, w: &mut W) -> io::Result<()> {
+        self.0.begin_object_value(w)
+    }
+    fn end_object_value<W: ?Sized + io::Write>(&mut self, w: &mut W) -> io::Result<()> {
+        self.0.end_object_value(w)
+    }
+    fn write_string_fragment<W: ?Sized + io::Write>(&mut self, w: &mut W, fragment: &str) -> io::Result<()> {
+        for c in fragment.chars() {
+            if c.is_ascii() && !matches!(c, '\'' | '&' | '+' | '<' | '>' | '`') {
+                w.write_all(&[c as u8])?;
+            } else {
+                for unit in c.encode_utf16(&mut [0u16; 2]) {
+                    write!(w, "\\u{:04X}", unit)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    fn write_char_escape<W: ?Sized + io::Write>(&mut self, w: &mut W, esc: serde_json::ser::CharEscape) -> io::Result<()> {
+        match esc {
+            serde_json::ser::CharEscape::Quote => w.write_all(b"\\u0022"),
+            other => self.0.write_char_escape(w, other),
+        }
+    }
+}
+
+/// Write the entries back with the original style (2-space indent, BOM and line endings kept).
+fn write_catalog_file(path: &Path, entries: &[Value], style: &FileStyle) -> Result<(), String> {
+    let mut buf: Vec<u8> = Vec::new();
+    let formatter = DotNetFormatter(serde_json::ser::PrettyFormatter::with_indent(b"  "));
+    let mut serializer = serde_json::Serializer::with_formatter(&mut buf, formatter);
+    entries
+        .serialize(&mut serializer)
+        .map_err(|e| format!("Serialisation failed: {e}"))?;
+    let mut text = String::from_utf8(buf).map_err(|e| format!("Serialisation failed: {e}"))?;
+    if style.crlf {
+        text = text.replace('\n', "\r\n");
+    }
+    if style.trailing_newline {
+        text.push_str(if style.crlf { "\r\n" } else { "\n" });
+    }
+    let mut bytes = Vec::with_capacity(text.len() + 3);
+    if style.bom {
+        bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+    }
+    bytes.extend_from_slice(text.as_bytes());
+    fs::write(path, bytes).map_err(|e| format!("Write failed: {e}"))
+}
+
+/// Overwrite `old` with `new`, but keep anything `old` has that `new` does not mention:
+/// object keys the editor does not know about, and the extra keys of array elements that
+/// stay at the same position. Arrays take the length of `new`.
+fn merge_preserving(old: &mut Value, new: &Value) {
+    match (old, new) {
+        (Value::Object(o), Value::Object(n)) => {
+            for (key, value) in n {
+                match o.get_mut(key) {
+                    Some(existing) => merge_preserving(existing, value),
+                    None => {
+                        o.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        (Value::Array(o), Value::Array(n)) => {
+            o.truncate(n.len());
+            for (i, value) in n.iter().enumerate() {
+                match o.get_mut(i) {
+                    Some(existing) => merge_preserving(existing, value),
+                    None => o.push(value.clone()),
+                }
+            }
+        }
+        (old, new) => *old = new.clone(),
+    }
+}
+
+/// Copy `path` to `<path>.bak` the first time it is written in this session, so the backup
+/// is the file as it was before a whole editing session (a batch edit saves many times).
+fn backup_once(path: &Path) -> Result<(), String> {
+    static DONE: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    let done = DONE.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut done = done.lock().map_err(|e| e.to_string())?;
+    if done.contains(path) {
+        return Ok(());
+    }
+    let mut bak = path.as_os_str().to_owned();
+    bak.push(".bak");
+    fs::copy(path, PathBuf::from(bak)).map_err(|e| format!("Backup failed: {e}"))?;
+    done.insert(path.to_path_buf());
+    Ok(())
+}
+
 // ── Display name resolution (internal) ───────────────────────────────────────
 
 /// Resolve a prototype runtime ID (as a decimal string) to a display name,
@@ -407,11 +559,17 @@ pub fn load_catalog_entries(server_exe: String) -> Result<Vec<CatalogEntryWithMe
     Ok(result)
 }
 
-/// Upsert a catalog entry into `{target_file_stem}MODIFIED.json`.
+/// Upsert a catalog entry directly into the existing catalog file.
 ///
-/// `target_file` is the base filename (e.g. `"CatalogBundle.json"`). Saves always go
-/// to the MODIFIED counterpart; the base file is never written by this command.
-/// A `.bak` snapshot of the existing MODIFIED file is written before any mutation.
+/// `target_file` is the base filename (e.g. `"CatalogBundle.json"`). The entry is written
+/// into that file, replacing the entry with the same `SkuId` or appending a new one. No
+/// `*MODIFIED.json` file is ever created. If the SKU also lives in a legacy `*MODIFIED.json`
+/// sibling (made by older versions), that copy is updated too, because the server loads
+/// both files and the sibling would otherwise keep overriding the edit.
+///
+/// The file is edited as raw JSON, not through the typed structs: every field the editor
+/// does not know about is kept, the key order is kept, and so are the file's line endings
+/// and BOM. A `.bak` copy of each file is made the first time it is written in a session.
 #[tauri::command]
 pub fn save_catalog_entry(
     server_exe: String,
@@ -420,36 +578,41 @@ pub fn save_catalog_entry(
 ) -> Result<(), String> {
     let dir = mtxstore_dir(&server_exe)?;
     let base_path = dir.join(&target_file);
-    let modified_path = modified_path_for(&base_path);
+    let legacy_path = modified_path_for(&base_path);
 
-    // Backup before touching
-    if modified_path.exists() {
-        let bak = modified_path.with_extension("json.bak");
-        fs::copy(&modified_path, &bak).map_err(|e| format!("Backup failed: {e}"))?;
+    if !base_path.is_file() {
+        return Err(format!("{target_file} not found in the MTXStore folder"));
     }
 
-    let mut disk_entries = load_disk_entries(&modified_path);
     let sku = entry.sku_id;
-    let disk_entry = view_to_disk(entry)?;
+    let new_value = serde_json::to_value(view_to_disk(entry)?)
+        .map_err(|e| format!("Serialisation failed: {e}"))?;
 
-    if let Some(existing) = disk_entries.iter_mut().find(|e| e.sku_id == sku) {
-        *existing = disk_entry;
-    } else {
-        disk_entries.push(disk_entry);
+    // Legacy sidecar first: only touched when it already holds this SKU.
+    if legacy_path.is_file() {
+        let (mut entries, style) = read_catalog_file(&legacy_path)?;
+        if let Some(existing) = entries.iter_mut().find(|e| sku_of(e) == Some(sku)) {
+            merge_preserving(existing, &new_value);
+            backup_once(&legacy_path)?;
+            write_catalog_file(&legacy_path, &entries, &style)?;
+        }
     }
 
-    let json = serde_json::to_string_pretty(&disk_entries)
-        .map_err(|e| format!("Serialisation failed: {e}"))?;
-    fs::write(&modified_path, json).map_err(|e| format!("Write failed: {e}"))?;
-
-    Ok(())
+    let (mut entries, style) = read_catalog_file(&base_path)?;
+    match entries.iter_mut().find(|e| sku_of(e) == Some(sku)) {
+        Some(existing) => merge_preserving(existing, &new_value),
+        None => entries.push(new_value),
+    }
+    backup_once(&base_path)?;
+    write_catalog_file(&base_path, &entries, &style)
 }
 
-/// Delete a catalog entry by SKU.
+/// Delete a catalog entry by SKU from the existing catalog file(s).
 ///
-/// `source_file` is the base filename (e.g. `"CatalogBundle.json"`).
-/// When `from_modified` is `true` the MODIFIED file is targeted; otherwise the base
-/// file. A `.bak` snapshot of the target file is written before deletion.
+/// `source_file` is the base filename (e.g. `"CatalogBundle.json"`). The entry is removed
+/// from that file and from its legacy `*MODIFIED.json` sibling when that holds it too, so
+/// a stale sidecar copy cannot keep the entry in the store. `from_modified` is kept for
+/// compatibility with the frontend and is no longer needed to choose the file.
 #[tauri::command]
 pub fn delete_catalog_entry(
     server_exe: String,
@@ -457,42 +620,31 @@ pub fn delete_catalog_entry(
     source_file: String,
     from_modified: bool,
 ) -> Result<(), String> {
+    let _ = from_modified;
     let dir = mtxstore_dir(&server_exe)?;
     let base_path = dir.join(&source_file);
+    let legacy_path = modified_path_for(&base_path);
 
-    let target_path = if from_modified {
-        modified_path_for(&base_path)
+    let mut removed = false;
+    for path in [&base_path, &legacy_path] {
+        if !path.is_file() {
+            continue;
+        }
+        let (mut entries, style) = read_catalog_file(path)?;
+        let before = entries.len();
+        entries.retain(|e| sku_of(e) != Some(sku_id));
+        if entries.len() != before {
+            backup_once(path)?;
+            write_catalog_file(path, &entries, &style)?;
+            removed = true;
+        }
+    }
+
+    if removed {
+        Ok(())
     } else {
-        base_path
-    };
-
-    if !target_path.exists() {
-        return Err(format!(
-            "{} not found",
-            target_path.file_name().unwrap_or_default().to_string_lossy()
-        ));
+        Err(format!("SKU {sku_id} not found in {source_file}"))
     }
-
-    let bak = target_path.with_extension("json.bak");
-    fs::copy(&target_path, &bak).map_err(|e| format!("Backup failed: {e}"))?;
-
-    let json =
-        fs::read_to_string(&target_path).map_err(|e| format!("Read failed: {e}"))?;
-    let mut disk_entries: Vec<CatalogEntryDisk> =
-        serde_json::from_str(&json).map_err(|e| format!("Parse failed: {e}"))?;
-
-    let before = disk_entries.len();
-    disk_entries.retain(|e| e.sku_id != sku_id);
-
-    if disk_entries.len() == before {
-        return Err(format!("SKU {sku_id} not found in target file"));
-    }
-
-    let json = serde_json::to_string_pretty(&disk_entries)
-        .map_err(|e| format!("Serialisation failed: {e}"))?;
-    fs::write(&target_path, json).map_err(|e| format!("Write failed: {e}"))?;
-
-    Ok(())
 }
 
 /// Scan all JSON files in the MTXStore directory (base and MODIFIED) and return the
@@ -850,4 +1002,142 @@ pub fn save_thumbnail(
     }
 
     Ok(backup_path.to_string_lossy().to_string())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn temp_server(tag: &str) -> (PathBuf, String) {
+        let root = std::env::temp_dir().join(format!("mhm_store_test_{tag}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("Data").join("Game").join("MTXStore")).unwrap();
+        let exe = root.join("MHServerEmu.exe").to_string_lossy().to_string();
+        (root, exe)
+    }
+
+    fn view_entry(sku: u64, title: &str) -> CatalogEntry {
+        CatalogEntry {
+            sku_id: sku,
+            guid_items: vec![GuidItem {
+                prototype_guid: 0,
+                item_prototype_runtime_id_for_client: "16313827754993193555".into(),
+                quantity: 1,
+            }],
+            additional_guid_items: vec![],
+            localized_entries: vec![LocalizedEntry {
+                language_id: "en_us".into(),
+                description: title.into(),
+                title: title.into(),
+                release_date: String::new(),
+                item_price: 900,
+            }],
+            info_urls: vec![],
+            content_data: vec![],
+            item_type: NamedItem { name: "Hero".into(), order: 0 },
+            type_modifiers: vec![],
+        }
+    }
+
+    #[test]
+    fn merge_keeps_unknown_keys_and_takes_new_values() {
+        let mut old = json!({"SkuId": 1, "Extra": "keep", "LocalizedEntries": [{"Title": "old", "Note": "keep"}, {"Title": "gone"}]});
+        let new = json!({"SkuId": 1, "LocalizedEntries": [{"Title": "new"}]});
+        merge_preserving(&mut old, &new);
+        assert_eq!(old["Extra"], "keep");
+        assert_eq!(old["LocalizedEntries"][0]["Title"], "new");
+        assert_eq!(old["LocalizedEntries"][0]["Note"], "keep");
+        assert_eq!(old["LocalizedEntries"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn save_writes_the_existing_file_and_never_creates_a_modified_file() {
+        let (root, exe) = temp_server("save");
+        let dir = root.join("Data").join("Game").join("MTXStore");
+        let base = dir.join("CatalogBundle.json");
+        // CRLF file with a key the editor does not know about, as the real server files can carry.
+        let original = "[\r\n  {\r\n    \"SkuId\": 5,\r\n    \"Unknown\": {\"a\": 1},\r\n    \"GuidItems\": [],\r\n    \"AdditionalGuidItems\": [],\r\n    \"LocalizedEntries\": [],\r\n    \"InfoUrls\": [],\r\n    \"ContentData\": [],\r\n    \"Type\": {\"Name\": \"Hero\", \"Order\": 0},\r\n    \"TypeModifiers\": []\r\n  }\r\n]";
+        fs::write(&base, original).unwrap();
+
+        save_catalog_entry(exe.clone(), view_entry(5, "Edited"), "CatalogBundle.json".into()).unwrap();
+        save_catalog_entry(exe.clone(), view_entry(6, "Brand new"), "CatalogBundle.json".into()).unwrap();
+
+        let text = fs::read_to_string(&base).unwrap();
+        assert!(text.contains("\r\n"), "line endings must be kept");
+        assert!(text.contains("\"Unknown\""), "fields the editor does not know must survive");
+        assert!(text.contains("Edited") && text.contains("Brand new"));
+        assert!(!dir.join("CatalogBundleMODIFIED.json").exists(), "no MODIFIED file may be created");
+        assert!(dir.join("CatalogBundle.json.bak").exists(), "a backup of the file is made");
+        let (entries, _) = read_catalog_file(&base).unwrap();
+        assert_eq!(entries.len(), 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_updates_a_legacy_sidecar_that_holds_the_same_sku_and_delete_clears_both() {
+        let (root, exe) = temp_server("legacy");
+        let dir = root.join("Data").join("Game").join("MTXStore");
+        let entry = |t: &str| json!([{"SkuId": 7, "GuidItems": [], "AdditionalGuidItems": [], "LocalizedEntries": [{"LanguageId": "en_us", "Description": t, "Title": t, "ReleaseDate": "", "ItemPrice": 1}], "InfoUrls": [], "ContentData": [], "Type": {"Name": "Hero", "Order": 0}, "TypeModifiers": []}]).to_string();
+        fs::write(dir.join("Catalog.json"), entry("base")).unwrap();
+        fs::write(dir.join("CatalogMODIFIED.json"), entry("sidecar")).unwrap();
+
+        save_catalog_entry(exe.clone(), view_entry(7, "Both"), "Catalog.json".into()).unwrap();
+        for file in ["Catalog.json", "CatalogMODIFIED.json"] {
+            assert!(fs::read_to_string(dir.join(file)).unwrap().contains("Both"), "{file} must carry the edit");
+        }
+
+        delete_catalog_entry(exe.clone(), 7, "Catalog.json".into(), true).unwrap();
+        for file in ["Catalog.json", "CatalogMODIFIED.json"] {
+            assert_eq!(read_catalog_file(&dir.join(file)).unwrap().0.len(), 0, "{file} must be empty");
+        }
+        assert!(delete_catalog_entry(exe, 7, "Catalog.json".into(), false).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Run by hand against the real files:  MTX_CATALOG_DIR=<...>/Data/Game/MTXStore cargo test real_files -- --ignored --nocapture
+    /// Proves a read and rewrite changes nothing.
+    #[test]
+    #[ignore]
+    fn real_files_round_trip_byte_for_byte() {
+        let dir = PathBuf::from(std::env::var("MTX_CATALOG_DIR").expect("set MTX_CATALOG_DIR"));
+        for file in base_catalog_files(&dir).unwrap() {
+            let original = fs::read(&file).unwrap();
+            let (entries, style) = read_catalog_file(&file).unwrap();
+            let out = std::env::temp_dir().join("mhm_roundtrip.json");
+            write_catalog_file(&out, &entries, &style).unwrap();
+            let same = fs::read(&out).unwrap() == original;
+            println!("{} : {}", file.file_name().unwrap().to_string_lossy(), if same { "identical" } else { "DIFFERENT" });
+            assert!(same, "{} changed on a plain rewrite", file.display());
+        }
+    }
+
+    /// Run by hand: MTX_CATALOG_DIR=<...>/Data/Game/MTXStore cargo test real_edit -- --ignored --nocapture
+    /// Edits one real entry in a COPY of Catalog.json and proves every other line is unchanged.
+    #[test]
+    #[ignore]
+    fn real_edit_changes_only_that_entry() {
+        let src = PathBuf::from(std::env::var("MTX_CATALOG_DIR").expect("set MTX_CATALOG_DIR")).join("Catalog.json");
+        let (root, exe) = temp_server("realedit");
+        let dir = root.join("Data").join("Game").join("MTXStore");
+        fs::copy(&src, dir.join("Catalog.json")).unwrap();
+        let original = fs::read_to_string(dir.join("Catalog.json")).unwrap();
+
+        let (entries, _) = read_catalog_file(&dir.join("Catalog.json")).unwrap();
+        let first: CatalogEntryDisk = serde_json::from_value(entries[10].clone()).unwrap();
+        let mut view = disk_to_view(first);
+        view.localized_entries[0].item_price += 1;
+        save_catalog_entry(exe, view, "Catalog.json".into()).unwrap();
+
+        let edited = fs::read_to_string(dir.join("Catalog.json")).unwrap();
+        let a: Vec<&str> = original.split("
+").collect();
+        let b: Vec<&str> = edited.split("
+").collect();
+        assert_eq!(a.len(), b.len(), "line count must not change");
+        let changed: Vec<usize> = (0..a.len()).filter(|&i| a[i] != b[i]).collect();
+        println!("lines changed: {:?}", changed.iter().map(|i| format!("{} -> {}", a[*i].trim(), b[*i].trim())).collect::<Vec<_>>());
+        assert_eq!(changed.len(), 1, "only the price line may change");
+        assert!(!dir.join("CatalogMODIFIED.json").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
 }

@@ -3,6 +3,16 @@
 <br>
 
 ---
+# Unreleased
+
+### Store editor writes the real catalog files
+- Saving or deleting a store entry now edits the existing `Catalog*.json` directly. No `*MODIFIED.json` file is created any more.
+- The file is edited as raw JSON, so fields the editor does not know about (bundle info and image data included), key order, line endings, BOM, the trailing newline and the server's `\uXXXX` string escaping are kept. A plain read and rewrite of every real catalog file is byte-for-byte identical (checked by an ignored test run against the server folder).
+- Legacy `*MODIFIED.json` files are still read, and are updated or cleared alongside the base file when they hold the same SKU, because the server loads both and the sidecar would otherwise keep overriding the edit.
+- A `.bak` copy of a file is made the first time it is written in a session (it used to be overwritten on every save).
+- `serde_json` now uses `preserve_order`; new unit tests live in `store.rs`.
+
+---
 # Version 1.2.2 Release
 
 ## What's Changed

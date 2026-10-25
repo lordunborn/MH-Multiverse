@@ -259,7 +259,7 @@
           entry:      newEntry,
           targetFile: orig.source_file,
         })
-        handleSaved({ ...newEntry, source_file: orig.source_file, from_modified: true })
+        handleSaved({ ...newEntry, source_file: orig.source_file, from_modified: orig.from_modified })
         count++
       }
       batchSuccess = `Updated ${count} entr${count !== 1 ? 'ies' : 'y'}.`
@@ -299,7 +299,7 @@
           entry:      newEntry,
           targetFile: orig.source_file,
         })
-        handleSaved({ ...newEntry, source_file: orig.source_file, from_modified: true })
+        handleSaved({ ...newEntry, source_file: orig.source_file, from_modified: orig.from_modified })
         count++
       }
       const verb   = action === 'add' ? 'Added to' : 'Removed from'

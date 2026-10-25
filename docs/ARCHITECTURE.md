@@ -203,7 +203,7 @@ The stdout reader additionally calls `parse_player_log_event` on every line; mat
 
 **`patches.rs`** - File I/O for `PatchData*.json` files in `Data/Game/Patches`. Enable/disable works by moving files between `Patches/` and `Patches/Off/`. Patch entries use `serde_json::Value` for the `Value` field to support arbitrary JSON value types.
 
-**`store.rs`** - Catalog entry management for `Catalog*.json` in `Data/Game/MTXStore`. Uses a base/MODIFIED file separation: base files are read-only from MH Multiverse's perspective, and all edits go to `*MODIFIED.json` sidecar files. MODIFIED entries override base entries with the same `SkuId`. The module handles u64 precision by using a dual type system: `CatalogEntryDisk` (raw u64 for on-disk JSON) and `CatalogEntry` (String for the JS boundary). Display name resolution chains through: custom override file → embedded `display_names.json` → prototype path → raw ID. Also generates HTML/CSS bundle pages for in-game store display.
+**`store.rs`** - Catalog entry management for `Catalog*.json` in `Data/Game/MTXStore`. Edits are written directly into the existing `Catalog*.json` file (no `*MODIFIED.json` file is ever created); the file is edited as raw JSON so unknown fields, key order, line endings and BOM are preserved. Legacy `*MODIFIED.json` sidecars made by older versions are still read (they override base entries with the same `SkuId`, as the server does) and are kept in step on save and delete. The module handles u64 precision by using a dual type system: `CatalogEntryDisk` (raw u64 for on-disk JSON) and `CatalogEntry` (String for the JS boundary). Display name resolution chains through: custom override file → embedded `display_names.json` → prototype path → raw ID. Also generates HTML/CSS bundle pages for in-game store display.
 
 **`calligraphy.rs`** - Reads MHServerEmu's `Calligraphy.sip` pak file (LZ4-compressed entries with a `KAPG` signature). Parses the `Blueprint.directory` and `Prototype.directory` files within the pak to build a `PrototypeCatalogue` with indices by runtime ID, path, and GUID. The catalogue is cached per sip file path and rebuilt automatically if the server executable changes. Prototype search supports multi-prefix category filtering and case-insensitive matching against both path and display name.
 
@@ -308,8 +308,8 @@ The stdout reader additionally calls `parse_player_log_event` on every line; mat
 | `get_mtxstore_dir` | `server_exe: String` | `String` | Return MTXStore directory path |
 | `list_catalog_files` | `server_exe: String` | `Vec<String>` | List base Catalog*.json filenames |
 | `load_catalog_entries` | `server_exe: String` | `Vec<CatalogEntryWithMeta>` | Load all entries with base/MODIFIED merge |
-| `save_catalog_entry` | `server_exe: String, entry: CatalogEntry, target_file: String` | `()` | Upsert entry into *MODIFIED.json |
-| `delete_catalog_entry` | `server_exe: String, sku_id: u64, source_file: String, from_modified: bool` | `()` | Delete entry by SKU from target file |
+| `save_catalog_entry` | `server_exe: String, entry: CatalogEntry, target_file: String` | `()` | Upsert entry directly into `target_file` (and its legacy MODIFIED sibling if that holds the SKU) |
+| `delete_catalog_entry` | `server_exe: String, sku_id: u64, source_file: String, from_modified: bool` | `()` | Delete entry by SKU from the base file and its legacy MODIFIED sibling |
 | `get_next_sku_id` | `server_exe: String` | `u64` | Return max SKU + 1 (floor 1001) |
 | `resolve_display_name` | `server_exe: String, prototype_runtime_id: String` | `String` | Resolve prototype ID to display name |
 | `generate_bundle_html` | `server_exe: String, entry: CatalogEntry, output_dir: String` | `String` | Generate HTML bundle page, return file path |
@@ -536,14 +536,14 @@ Patch entries use `serde_json::Value` for the `Value` field, allowing arbitrary 
 
 ### Catalog File I/O
 
-The catalog editor uses a base/MODIFIED file separation pattern:
+The catalog editor writes straight into the existing catalog file:
 
 ```
-CatalogBundle.json           ← base file (read-only from MH Multiverse)
-CatalogBundleMODIFIED.json   ← sidecar with user edits
+CatalogBundle.json           ← edited in place
+CatalogBundleMODIFIED.json   ← legacy sidecar from older versions; read, and kept in step if it holds the same SKU, never created
 ```
 
-On load, entries from both files are merged by `SkuId` - MODIFIED entries override base entries. On save, the entry is upserted into the MODIFIED file. On delete, the entry is removed from whichever file contains it (base or MODIFIED). A `.bak` snapshot of the target file is written before every mutation.
+On load, entries from both files are merged by `SkuId` (the server does the same: the later file overrides). On save, the entry is merged into the existing raw JSON object for that `SkuId` (fields the editor does not know stay), or appended if new. On delete, the entry is removed from the base file and from the legacy sidecar if present. The file is rewritten with its own line endings, BOM, trailing newline and the server's .NET string escaping (\u0027 and the like), so untouched entries stay byte-for-byte identical. A `.bak` copy of each file is made the first time it is written in a session.
 
 ### Calligraphy.sip Reading
 
@@ -599,9 +599,9 @@ run_update
 
 Prototype runtime IDs and GUIDs are u64 values that can exceed JavaScript's `Number.MAX_SAFE_INTEGER` (2^53 - 1). The catalog system handles this with dual types: `CatalogEntryDisk` uses raw `u64` for on-disk serialisation, while the frontend-facing `CatalogEntry` represents these as `String`. Conversion happens in `guid_disk_to_view` and `guid_view_to_disk`. Calligraphy prototype IDs and GUIDs are similarly transported as decimal strings.
 
-### MODIFIED File Pattern (Store)
+### Catalog files (Store)
 
-Catalog edits are never written to the base `Catalog*.json` files. Instead, a `*MODIFIED.json` sidecar file holds user-created or user-modified entries. This means a server update can safely overwrite base catalog files without losing user edits. The merge-by-SkuId logic in `load_catalog_entries` makes the MODIFIED version authoritative when both exist.
+Catalog edits are written directly to the existing `Catalog*.json` files. Earlier versions wrote `*MODIFIED.json` sidecars, which held only the edited entries and did not work properly with the server's store. Back up before a server update that replaces catalog files; the app only keeps a per-session `.bak`.
 
 ### EventsOverride / Default File Pattern (Events)
 

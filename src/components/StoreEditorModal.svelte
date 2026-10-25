@@ -494,7 +494,8 @@
       const built  = buildEntry()
       const target = isNew ? targetFile : entry!.source_file
       await invoke('save_catalog_entry', { serverExe, entry: built, targetFile: target })
-      const meta: CatalogEntryWithMeta = { ...built, source_file: target, from_modified: true }
+      // Saves go straight into the existing catalog file now, so the provenance flag does not change.
+      const meta: CatalogEntryWithMeta = { ...built, source_file: target, from_modified: isNew ? false : entry!.from_modified }
       initialStateSerialized = currentStateSerialized
       saveSuccess = true
       setTimeout(() => (saveSuccess = false), 3000)
@@ -623,7 +624,7 @@
       const target = entry!.source_file
       await invoke('save_catalog_entry', { serverExe, entry: built, targetFile: target })
       initialStateSerialized = currentStateSerialized
-      onSaved({ ...built, source_file: target, from_modified: true })
+      onSaved({ ...built, source_file: target, from_modified: entry!.from_modified })
 
       // Generate and save thumbnail.
       const pngBase64 = await generateThumbnailBase64()
