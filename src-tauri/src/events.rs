@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -64,20 +65,10 @@ struct RawEventDefIn {
     is_hidden: Option<bool>,
 }
 
-/// Written back to Events.json — optional fields are omitted when None.
-#[derive(Debug, Serialize)]
-struct RawEventDefOut {
-    #[serde(rename = "DisplayName")]
-    display_name: String,
-    #[serde(rename = "FilePath")]
-    file_path: String,
-    #[serde(rename = "DailyGift", skip_serializing_if = "Option::is_none")]
-    daily_gift: Option<String>,
-    #[serde(rename = "InstancedMissions", skip_serializing_if = "Option::is_none")]
-    instanced_missions: Option<Vec<String>>,
-    #[serde(rename = "IsHidden", skip_serializing_if = "Option::is_none")]
-    is_hidden: Option<bool>,
-}
+/// The fields of an Events.json entry the editor changes. Every other field of an entry (Leaderboards, Waypoints and
+/// anything added later) is kept exactly as the file has it: the server reads EventsOverride.json instead of
+/// Events.json when it exists, so a field left out of the override is lost to the server.
+const EDITED_FIELDS: [&str; 5] = ["DisplayName", "FilePath", "DailyGift", "InstancedMissions", "IsHidden"];
 
 /// Matches one entry in the EventSchedule.json array.
 #[derive(Debug, Deserialize, Serialize)]
@@ -161,24 +152,79 @@ fn read_schedule_from_path(path: &Path) -> Result<Vec<ScheduleRule>, String> {
         .collect())
 }
 
-fn write_events_to_path(path: &Path, definitions: &[EventDefinition]) -> Result<(), String> {
-    // Events.json is an object keyed by event ID. HashMap does not guarantee
-    // key order; the override file is valid regardless of ordering.
-    let map: HashMap<&str, RawEventDefOut> = definitions
-        .iter()
-        .map(|def| {
-            (
-                def.id.as_str(),
-                RawEventDefOut {
-                    display_name: def.display_name.clone(),
-                    file_path: def.file_path.clone(),
-                    daily_gift: def.daily_gift.clone(),
-                    instanced_missions: def.instanced_missions.clone(),
-                    is_hidden: def.is_hidden,
-                },
-            )
-        })
-        .collect();
+/// Reads Events.json or EventsOverride.json as raw JSON, keeping every field of every entry.
+fn read_raw_events(path: &Path) -> Result<Map<String, Value>, String> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+
+    serde_json::from_str::<Map<String, Value>>(contents.trim_start_matches('\u{feff}'))
+        .map_err(|e| format!("JSON parse error in {}: {e}", path.display()))
+}
+
+fn set_or_remove(entry: &mut Map<String, Value>, key: &str, value: Option<Value>) {
+    match value {
+        Some(v) => {
+            entry.insert(key.to_string(), v);
+        }
+        None => {
+            entry.remove(key);
+        }
+    }
+}
+
+/// Builds the entries to write: for each definition, the entry already in the file (or the default Events.json entry
+/// when the file has none) with only the edited fields updated. Fields the editor does not edit are carried over
+/// untouched, and any such field the existing file lacks but the default has (an override written by an older version
+/// of this app dropped Leaderboards and Waypoints) is restored from the default.
+fn build_events_map(
+    definitions: &[EventDefinition],
+    existing: &Map<String, Value>,
+    defaults: &Map<String, Value>,
+) -> Map<String, Value> {
+    let mut out = Map::new();
+
+    for def in definitions {
+        let mut entry: Map<String, Value> = existing
+            .get(&def.id)
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+
+        if let Some(default_entry) = defaults.get(&def.id).and_then(|v| v.as_object()) {
+            for (key, value) in default_entry {
+                if !EDITED_FIELDS.contains(&key.as_str()) && !entry.contains_key(key) {
+                    entry.insert(key.clone(), value.clone());
+                }
+            }
+        }
+
+        entry.insert("DisplayName".to_string(), Value::String(def.display_name.clone()));
+        entry.insert("FilePath".to_string(), Value::String(def.file_path.clone()));
+        set_or_remove(&mut entry, "DailyGift", def.daily_gift.clone().map(Value::String));
+        set_or_remove(
+            &mut entry,
+            "InstancedMissions",
+            def.instanced_missions
+                .clone()
+                .map(|list| Value::Array(list.into_iter().map(Value::String).collect())),
+        );
+        set_or_remove(&mut entry, "IsHidden", def.is_hidden.map(Value::Bool));
+
+        out.insert(def.id.clone(), Value::Object(entry));
+    }
+
+    out
+}
+
+fn write_events_to_path(
+    path: &Path,
+    default_path: &Path,
+    definitions: &[EventDefinition],
+) -> Result<(), String> {
+    let existing = if path.exists() { read_raw_events(path)? } else { Map::new() };
+    let defaults = if default_path.exists() { read_raw_events(default_path)? } else { Map::new() };
+
+    let map = build_events_map(definitions, &existing, &defaults);
 
     let contents = serde_json::to_string_pretty(&map)
         .map_err(|e| format!("JSON serialisation error: {e}"))?;
@@ -271,7 +317,8 @@ pub fn save_events_override(
     definitions: Vec<EventDefinition>,
 ) -> Result<(), String> {
     let dir = live_tuning_dir(&server_exe)?;
-    write_events_to_path(&dir.join("EventsOverride.json"), &definitions)
+    let (override_path, default_path) = events_file_paths(&dir);
+    write_events_to_path(&override_path, &default_path, &definitions)
 }
 
 #[tauri::command]
@@ -346,7 +393,7 @@ pub fn merge_events_override(server_exe: String) -> Result<EventsData, String> {
         }
     }
 
-    write_events_to_path(&override_path, &current)?;
+    write_events_to_path(&override_path, &default_path, &current)?;
     Ok(EventsData {
         definitions: current,
         using_override: true,
@@ -383,4 +430,148 @@ pub fn merge_schedule_override(server_exe: String) -> Result<ScheduleData, Strin
         rules: current,
         using_override: true,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn def(id: &str, name: &str) -> EventDefinition {
+        EventDefinition {
+            id: id.to_string(),
+            display_name: name.to_string(),
+            file_path: format!("Events/{id}.json"),
+            daily_gift: None,
+            instanced_missions: None,
+            is_hidden: None,
+        }
+    }
+
+    fn obj(v: Value) -> Map<String, Value> {
+        v.as_object().cloned().unwrap()
+    }
+
+    #[test]
+    fn saving_keeps_fields_the_editor_does_not_know() {
+        let existing = obj(json!({
+            "CivilWar": {
+                "DisplayName": "Civil War",
+                "FilePath": "Events/CivilWar.json",
+                "Leaderboards": ["a.prototype", "b.prototype"],
+                "Waypoints": ["w.prototype"],
+                "SomethingNew": {"x": 1}
+            }
+        }));
+
+        let out = build_events_map(&[def("CivilWar", "Civil War Renamed")], &existing, &Map::new());
+        let entry = &out["CivilWar"];
+
+        assert_eq!(entry["DisplayName"], "Civil War Renamed");
+        assert_eq!(entry["Leaderboards"], json!(["a.prototype", "b.prototype"]));
+        assert_eq!(entry["Waypoints"], json!(["w.prototype"]));
+        assert_eq!(entry["SomethingNew"], json!({"x": 1}));
+    }
+
+    #[test]
+    fn saving_restores_fields_an_older_override_dropped() {
+        let existing = obj(json!({
+            "WealthOfKingsCounty": {"DisplayName": "Wealth", "FilePath": "Events/W.json"}
+        }));
+        let defaults = obj(json!({
+            "WealthOfKingsCounty": {
+                "DisplayName": "Wealth",
+                "FilePath": "Events/W.json",
+                "Leaderboards": ["ic.prototype", "icc.prototype"]
+            }
+        }));
+
+        let out = build_events_map(&[def("WealthOfKingsCounty", "Wealth")], &existing, &defaults);
+
+        assert_eq!(out["WealthOfKingsCounty"]["Leaderboards"], json!(["ic.prototype", "icc.prototype"]));
+    }
+
+    #[test]
+    fn edited_fields_win_and_can_be_cleared() {
+        let existing = obj(json!({
+            "A": {"DisplayName": "A", "FilePath": "Events/A.json", "DailyGift": "gift", "IsHidden": true}
+        }));
+        let defaults = obj(json!({
+            "A": {"DisplayName": "A", "FilePath": "Events/A.json", "DailyGift": "gift", "IsHidden": true}
+        }));
+
+        // The editor cleared the gift and the hidden flag: they must not come back from the default.
+        let out = build_events_map(&[def("A", "A")], &existing, &defaults);
+        assert!(out["A"].get("DailyGift").is_none());
+        assert!(out["A"].get("IsHidden").is_none());
+
+        let mut with_values = def("A", "A");
+        with_values.daily_gift = Some("new gift".to_string());
+        with_values.instanced_missions = Some(vec!["m1".to_string()]);
+        with_values.is_hidden = Some(false);
+        let out = build_events_map(&[with_values], &existing, &defaults);
+        assert_eq!(out["A"]["DailyGift"], "new gift");
+        assert_eq!(out["A"]["InstancedMissions"], json!(["m1"]));
+        assert_eq!(out["A"]["IsHidden"], false);
+    }
+
+    #[test]
+    fn new_and_deleted_events_follow_the_editor() {
+        let existing = obj(json!({
+            "Old": {"DisplayName": "Old", "FilePath": "Events/Old.json", "Leaderboards": ["x"]}
+        }));
+
+        let out = build_events_map(&[def("Brand", "Brand New")], &existing, &Map::new());
+
+        assert!(out.get("Old").is_none());
+        assert_eq!(out["Brand"]["DisplayName"], "Brand New");
+        assert!(out["Brand"].get("Leaderboards").is_none());
+    }
+
+    /// Reads a real Events.json (set MHM_TEST_LIVETUNING_DIR to a server's Data/Game/LiveTuning folder), saves it through the
+    /// editor path with no edits and checks the result equals the original. Run with: cargo test real_events -- --ignored
+    #[test]
+    #[ignore]
+    fn real_events_json_survives_a_save_unchanged() {
+        let dir = std::path::PathBuf::from(std::env::var("MHM_TEST_LIVETUNING_DIR").expect("set MHM_TEST_LIVETUNING_DIR"));
+        let default_path = dir.join("Events.json");
+        let out_path = std::env::temp_dir().join(format!("mhm-real-events-{}.json", std::process::id()));
+
+        let definitions = read_events_from_path(&default_path).unwrap();
+        write_events_to_path(&out_path, &default_path, &definitions).unwrap();
+
+        let original = read_raw_events(&default_path).unwrap();
+        let written = read_raw_events(&out_path).unwrap();
+        let _ = std::fs::remove_file(&out_path);
+
+        assert_eq!(Value::Object(original), Value::Object(written));
+    }
+
+    #[test]
+    fn writing_a_file_round_trips_leaderboards() {
+        let dir = std::env::temp_dir().join(format!("mhm-events-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let default_path = dir.join("Events.json");
+        let override_path = dir.join("EventsOverride.json");
+
+        std::fs::write(
+            &default_path,
+            r#"{ "Midtown": { "DisplayName": "Midtown", "FilePath": "Events/M.json", "Leaderboards": ["m1", "m2"], "Waypoints": ["w"] } }"#,
+        )
+        .unwrap();
+
+        // No override yet: the first save must still carry the default's extra fields.
+        write_events_to_path(&override_path, &default_path, &[def("Midtown", "Midtown Madness")]).unwrap();
+        let written = read_raw_events(&override_path).unwrap();
+        assert_eq!(written["Midtown"]["Leaderboards"], json!(["m1", "m2"]));
+        assert_eq!(written["Midtown"]["Waypoints"], json!(["w"]));
+        assert_eq!(written["Midtown"]["DisplayName"], "Midtown Madness");
+
+        // And a second save keeps them.
+        write_events_to_path(&override_path, &default_path, &[def("Midtown", "Midtown Madness 2")]).unwrap();
+        let written = read_raw_events(&override_path).unwrap();
+        assert_eq!(written["Midtown"]["Leaderboards"], json!(["m1", "m2"]));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

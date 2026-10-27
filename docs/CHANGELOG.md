@@ -5,6 +5,11 @@
 ---
 # Unreleased
 
+### Event overrides keep their leaderboards
+- Saving the events override used to write only five fields per event (name, file, daily gift, instanced missions, hidden) and dropped everything else, including `Leaderboards` and `Waypoints`. The server reads `EventsOverride.json` instead of `Events.json` when it exists, so every event lost its leaderboards and event waypoints.
+- Saving now edits only those five fields and keeps every other field of an entry as the file has it (so fields added by newer server versions survive too). An override that an older version already stripped is repaired the next time it is saved: the missing fields are restored from `Events.json`. Merging also carries the full entry for events added from `Events.json`.
+- Unit tests cover keeping unknown fields, restoring dropped ones, clearing edited fields, new and deleted events, and a file round trip. An ignored test saves a real server's `Events.json` through the editor and checks it comes back unchanged.
+
 ### Store editor writes the real catalog files
 - Saving or deleting a store entry now edits the existing `Catalog*.json` directly. No `*MODIFIED.json` file is created any more.
 - The file is edited as raw JSON, so fields the editor does not know about (bundle info and image data included), key order, line endings, BOM, the trailing newline and the server's `\uXXXX` string escaping are kept. A plain read and rewrite of every real catalog file is byte-for-byte identical (checked by an ignored test run against the server folder).
